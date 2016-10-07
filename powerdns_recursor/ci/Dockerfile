@@ -8,5 +8,5 @@ VOLUME ["/etc/powerdns"]
 ADD recursor.conf /etc/powerdns/recursor.conf
 
 EXPOSE 5353/udp
-EXPOSE 8082/udp
+EXPOSE 8082
 ENTRYPOINT ["/usr/sbin/pdns_recursor", "--daemon=no"]

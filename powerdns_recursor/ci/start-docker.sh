@@ -13,7 +13,7 @@ if docker ps -a | grep $NAME >/dev/null; then
   bash powerdns_recursor/ci/stop-docker.sh
 fi
 
-docker create --expose $PORT2/udp --expose $PORT/udp -p $PORT:$PORT/udp -p $PORT2:$PORT2/udp --name $NAME datadog/powerdns_recursor
+docker create --expose $PORT2 --expose $PORT/udp -p $PORT:$PORT -p $PORT2:$PORT2/udp --name $NAME datadog/powerdns_recursor
 docker cp ./powerdns_recursor/ci/recursor.conf $NAME:/etc/powerdns/recursor.conf
 docker start $NAME
 
