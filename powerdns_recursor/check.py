@@ -67,15 +67,20 @@ class PowerDNSRecursorCheck(AgentCheck):
 
     def _get_pdns_stats(self, config):
         url = "http://{}:{}/servers/localhost/statistics".format(config.host, config.port)
+        url2 = "http://{}:{}/api/v1/servers/localhost/statistics".format(config.host, config.port)
         service_check_tags = ['recursor_host:{}'.format(config.host), 'recursor_port:{}'.format(config.port)]
         headers = {"X-API-Key": config.api_key}
         try:
             request = requests.get(url, headers=headers)
             request.raise_for_status()
         except Exception:
-            self.service_check(self.SERVICE_CHECK_NAME, AgentCheck.CRITICAL,
-                               tags=service_check_tags)
-            raise
+            try:
+                request = requests.get(url2, headers=headers)
+                request.raise_for_status()
+            except Exception:
+                self.service_check(self.SERVICE_CHECK_NAME, AgentCheck.CRITICAL,
+                                   tags=service_check_tags)
+                raise
         self.service_check(self.SERVICE_CHECK_NAME, AgentCheck.OK,
                            tags=service_check_tags)
         return request.json()
