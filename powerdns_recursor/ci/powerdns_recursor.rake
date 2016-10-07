@@ -19,7 +19,7 @@ namespace :ci do
                            "#{ENV['VOLATILE_DIR']}/ci.log", use_venv)
       # sample docker usage
       sh %(bash powerdns_recursor/ci/start-docker.sh)
-      Wait.for 5353, 5
+      Wait.for 8082, 5
     end
 
     task before_script: ['ci:common:before_script']
