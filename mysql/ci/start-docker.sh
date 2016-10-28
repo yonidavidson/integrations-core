@@ -21,9 +21,16 @@ echo 'running'
 # Making the whole process wait for n seconds is not a good option:
 # With a large variety of infrastructure, such an option will inevitably cause test flakiness and failures
 # So, we grep the logs instead.
+WAITED=0
 until [[ `docker logs dd-test-mysql 2>&1` =~ .*"MySQL init process done. Ready for start up" ]];
 do
+  if [[ $WAITED -eq 10 ]]; then
+    echo "Mysql has failed to come up in time. Here are the logs: "
+    docker logs dd-test-mysql
+    exit 1
+  fi
   sleep 2
+  WAITED=$(($WAITED+1))
 done
 
 echo 'ready'
