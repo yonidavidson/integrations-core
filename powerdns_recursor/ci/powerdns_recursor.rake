@@ -1,24 +1,31 @@
 require 'ci/common'
 
 def powerdns_recursor_version
-  ENV['FLAVOR_VERSION'] || 'latest'
+  ENV['FLAVOR_VERSION'] || '3.7.3'
 end
 
 def powerdns_recursor_rootdir
   "#{ENV['INTEGRATIONS_DIR']}/powerdns_recursor_#{powerdns_recursor_version}"
 end
 
+container_name = 'dd-test-powerdns-recursor'
+container_port1 = 8082
+container_port2 = 5353
+
 namespace :ci do
   namespace :powerdns_recursor do |flavor|
-    task before_install: ['ci:common:before_install']
+    task before_install: ['ci:common:before_install'] do
+      sh %(docker kill #{container_name} 2>/dev/null || true)
+      sh %(docker rm #{container_name} 2>/dev/null || true)
+    end
 
     task install: ['ci:common:install'] do
       use_venv = in_venv
       install_requirements('powerdns_recursor/requirements.txt',
                            "--cache-dir #{ENV['PIP_CACHE']}",
                            "#{ENV['VOLATILE_DIR']}/ci.log", use_venv)
-      # sample docker usage
-      sh %(bash powerdns_recursor/ci/start-docker.sh)
+      pdns_tag = 'powerdns_recursor_' + powerdns_recursor_version.gsub('.', '_')
+      sh %(docker run -d --expose #{container_port2} --expose #{container_port1}/udp -p #{container_port1}:#{container_port1} -p #{container_port2}:#{container_port2}/udp --name #{container_name} datadog/docker-library:#{pdns_tag})
       Wait.for 8082, 5
     end
 
@@ -35,7 +42,8 @@ namespace :ci do
 
     # sample cleanup task
     task cleanup: ['ci:common:cleanup'] do
-      sh %(bash powerdns_recursor/ci/stop-docker.sh)
+      sh %(docker kill #{container_name} 2>/dev/null || true)
+      sh %(docker rm #{container_name} 2>/dev/null || true)
     end
 
     task :execute do
