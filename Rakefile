@@ -1,6 +1,7 @@
 #!/usr/bin/env rake
 
 require 'rake'
+require 'pp'
 
 unless ENV['CI']
   rakefile_dir = File.dirname(__FILE__)
@@ -79,4 +80,32 @@ task dd_agent_consistency: [:pull_latest_agent] do
     'yaml example file',
     find_inconsistencies(find_yaml_confs, 'conf.d')
   )
+end
+
+desc 'Outputs the checks/example configs of this repo that do not match the ones in `dd-agent` (temporary task)'
+task make_consistent_dd_agent: [:pull_latest_agent] do
+  find_check_files.each do |file_basename, file_path|
+    dd_agent_file_path = File.join(
+      ENV['SDK_HOME'],
+      'embedded',
+      'dd-agent',
+      'checks.d',
+      file_basename
+    )
+    if File.exist?(dd_agent_file_path)
+      FileUtils.cp(dd_agent_file_path, file_path)
+    end
+  end
+  find_yaml_confs.each do |file_basename, file_path|
+    dd_agent_file_path = File.join(
+      ENV['SDK_HOME'],
+      'embedded',
+      'dd-agent',
+      'conf.d',
+      file_basename
+    )
+    if File.exist?(dd_agent_file_path)
+      FileUtils.cp(dd_agent_file_path, file_path)
+    end
+  end
 end
