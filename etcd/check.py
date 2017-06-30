@@ -156,13 +156,13 @@ class Etcd(AgentCheck):
                                tags=instance_tags)
 
     def _get_self_metrics(self, url, ssl_params, timeout, tags):
-        return self._get_json(url + "/v2/stats/self",  ssl_params, timeout)
+        return self._get_json(url + "/v2/stats/self",  ssl_params, timeout, tags)
 
     def _get_store_metrics(self, url, ssl_params, timeout, tags):
-        return self._get_json(url + "/v2/stats/store",  ssl_params, timeout)
+        return self._get_json(url + "/v2/stats/store",  ssl_params, timeout, tags)
 
     def _get_leader_metrics(self, url, ssl_params, timeout, tags):
-        return self._get_json(url + "/v2/stats/leader", ssl_params, timeout)
+        return self._get_json(url + "/v2/stats/leader", ssl_params, timeout, tags)
 
     def _get_json(self, url, ssl_params, timeout, tags):
         try:
