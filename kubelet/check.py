@@ -6,6 +6,7 @@
 from checks import CheckException
 from checks.prometheus_check import PrometheusCheck
 from utils.dockerutil import DockerUtil
+from utils.kubernetes.kubeutil import KubeUtil
 
 METRIC_TYPES = ['counter', 'gauge']
 CONTAINER_LABELS = [
@@ -27,12 +28,16 @@ CONTAINER_LABELS_TO_TAGS = {
 
 class KubeletCheck(PrometheusCheck):
     """
-    Collect kube-dns metrics from Prometheus
+    Collect Kubelet metrics
     """
     def __init__(self, name, init_config, agentConfig, instances=None):
         super(KubeletCheck, self).__init__(name, init_config, agentConfig, instances)
         self.NAMESPACE = 'kubernetes'
         self.dockerutil = DockerUtil()
+        try:
+            self.kubeutil = KubeUtil()
+        except Exception as ex:
+            raise CheckException("Couldn't instantiate the Kubernetes client. Error: %s" % str(ex))
 
         self.metrics_mapper = {}
         self.ignore_metrics = {}
@@ -42,6 +47,8 @@ class KubeletCheck(PrometheusCheck):
         self.fs_usage_bytes = {}
         self.mem_usage_bytes = {}
 
+        # pod --> tags map
+        self.kube_pod_tags = {}
 
     def check(self, instance):
         endpoint = instance.get('prometheus_endpoint')
@@ -54,6 +61,11 @@ class KubeletCheck(PrometheusCheck):
             send_buckets = False
         else:
             send_buckets = True
+
+        try:
+            self.kube_pod_tags = self.kubeutil.get_kube_pod_tags()
+        except Exception as e:
+            self.log.warning('Could not retrieve kubernetes tags: %s' % str(e))
 
         self.process(endpoint, send_histograms_buckets=send_buckets, instance=instance)
 
@@ -74,7 +86,7 @@ class KubeletCheck(PrometheusCheck):
         return True
 
     def _extract_image_tags(self, image_label):
-        """Perform an ugly hack to get the image tags using dockerutil"""
+        """Get the image tags using dockerutil"""
         tags = []
         # These extracters expect a container dict.
         # We pass them one with the only info they need
@@ -90,6 +102,25 @@ class KubeletCheck(PrometheusCheck):
             tags.append('image_tag:%s' % image_tag_array[0])
         return tags
 
+    def _extract_metric_tags(self, labels):
+        tags = []
+        pname, ns = None, None
+        for label in labels:
+            if label.name == 'image':
+                tags += self._extract_image_tags(label.value)
+            elif label.name == "pod_name":
+                pname = label.value
+                tags.append('pod_name:%s' % pname)
+            elif label.name == 'namespace':
+                ns = label.value
+                tags.append('namespace:%s' % ns)
+            else:
+                if label.name in CONTAINER_LABELS_TO_TAGS:
+                    tags.append('{}:{}'.format(CONTAINER_LABELS_TO_TAGS[label.name], label.value))
+            if pname and ns:
+                tags += self.kube_pod_tags.get('{}/{}'.format(ns, pname), [])
+        return tags
+
     def container_cpu_usage_seconds_total(self, message, **kwargs):
         metric_name = self.NAMESPACE + '.cpu.usage.total'
         if message.type >= len(METRIC_TYPES):
@@ -98,14 +129,7 @@ class KubeletCheck(PrometheusCheck):
 
         for metric in message.metric:
             if self._is_container_metric(metric):
-                tags = []
-                for label in metric.label:
-                    if label.name == 'image':
-                        tags += self._extract_image_tags(label.value)
-                    else:
-                        if label.name in CONTAINER_LABELS_TO_TAGS:
-                            tags.append('{}:{}'.format(CONTAINER_LABELS_TO_TAGS[label.name], label.value))
-
+                tags = self._extract_metric_tags(metric.label)
                 val = getattr(metric, METRIC_TYPES[message.type]).value
                 self.rate(metric_name, val, tags)
 
@@ -116,20 +140,15 @@ class KubeletCheck(PrometheusCheck):
         it also submit said value and tags as a gauge.
         """
         # track containers that still exist in the cache
-        seen_keys = dict(zip(cache.keys(), [False for x in xrange(len(cache.keys()))]))
+        seen_keys = {k: False for k in cache.keys()}
         for metric in message.metric:
             if self._is_container_metric(metric):
-                tags = []
-                c_name = ''
-                for lbl in metric.label:
-                    if lbl.name == 'image':
-                        tags += self._extract_image_tags(lbl.value)
-                    else:
-                        if lbl.name in CONTAINER_LABELS_TO_TAGS:
-                            if lbl.name == 'name':
-                                c_name = lbl.value
-                            tags.append('{}:{}'.format(CONTAINER_LABELS_TO_TAGS[lbl.name], lbl.value))
-
+                tags = self._extract_metric_tags(metric.label)
+                c_name = None
+                for t in tags:
+                    if t.split(':', 1)[0] == 'container_name':
+                        c_name = t.split(':', 1)[1]
+                        break
                 val = getattr(metric, METRIC_TYPES[message.type]).value
                 if c_name:
                     cache[c_name] = (val, tags)
@@ -139,38 +158,34 @@ class KubeletCheck(PrometheusCheck):
         # purge the cache
         for k, seen in seen_keys.iteritems():
             if not seen:
-                del cache[seen]
+                del cache[k]
 
-    def _process_limit_metric(self, m_name, message, cache, limit_m_name=None):
+    def _process_limit_metric(self, m_name, message, cache, pct_m_name=None):
         """
-        checks in the given cache if there's a usage for each metric in the message
-        and reports the usage_pct, and optionally the limit itself
+        reports limit metrics if m_name is not an empty string,
+        and optionally checks in the given cache if there's a usage
+        for each metric in the message and reports the usage_pct
         """
         for metric in message.metric:
             if self._is_container_metric(metric):
-                usage = None
-                c_name = ''
-                for lbl in metric.label:
-                    if lbl.name == 'name':
-                        c_name = lbl.value
-                        usage, tags = cache.get(c_name, (None, None))
-                        break
+                limit = getattr(metric, METRIC_TYPES[message.type]).value
+                tags = self._extract_metric_tags(metric.label)
 
-                if usage and tags:
-                    limit = getattr(metric, METRIC_TYPES[message.type]).value
-                    if limit > 0:
-                        self.gauge(m_name, float(usage/float(limit)), tags)
-                else:
-                    self.log.debug("No corresponding usage found for metric %s and container %s, skipping usage_pct for now." % (m_name, c_name))
-                if limit_m_name:
-                    tags = []
+                if m_name:
+                    self.gauge(m_name, limit, tags)
+
+                if pct_m_name and limit > 0:
+                    usage = None
+                    c_name = ''
                     for lbl in metric.label:
-                        if lbl.name == 'image':
-                            tags += self._extract_image_tags(lbl.value)
-                        else:
-                            if lbl.name in CONTAINER_LABELS_TO_TAGS:
-                                tags.append('{}:{}'.format(CONTAINER_LABELS_TO_TAGS[lbl.name], lbl.value))
-                    self.gauge(limit_m_name, limit, tags)
+                        if lbl.name == 'name':
+                            c_name = lbl.value
+                            usage, tags = cache.get(c_name, (None, None))
+                            break
+                    if usage:
+                        self.gauge(pct_m_name, float(usage/float(limit)), tags)
+                    else:
+                        self.log.debug("No corresponding usage found for metric %s and container %s, skipping usage_pct for now." % (m_name, c_name))
 
     def container_fs_usage_bytes(self, message, **kwargs):
         """Number of bytes that are consumed by the container on this filesystem."""
@@ -185,11 +200,11 @@ class KubeletCheck(PrometheusCheck):
         Number of bytes that can be consumed by the container on this filesystem.
         This method is used by container_fs_usage_bytes, it doesn't report any metric
         """
-        metric_name = self.NAMESPACE + '.filesystem.usage_pct'
+        pct_m_name = self.NAMESPACE + '.filesystem.usage_pct'
         if message.type >= len(METRIC_TYPES):
             self.log.error("Metric type %s unsupported for metric %s" % (message.type, message.name))
             return
-        self._process_limit_metric(self, metric_name, message, self.fs_usage_bytes)
+        self._process_limit_metric('', message, self.fs_usage_bytes, pct_m_name)
 
     def container_memory_usage_bytes(self, message, **kwargs):
         metric_name = self.NAMESPACE + '.memory.usage'
