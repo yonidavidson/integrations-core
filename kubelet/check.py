@@ -2,13 +2,28 @@
 # All rights reserved
 # Licensed under Simplified BSD License (see LICENSE)
 
+# stdlib
+from collections import defaultdict
+
 # project
-from checks import CheckException
+from checks import AgentCheck, CheckException
 from checks.prometheus_check import PrometheusCheck
+from config import _is_affirmative
 from utils.dockerutil import DockerUtil
 from utils.kubernetes.kubeutil import KubeUtil
 
-METRIC_TYPES = ['counter', 'gauge']
+METRIC_TYPES = ['counter', 'gauge', 'summary']
+
+DEFAULT_USE_HISTOGRAM = False
+GAUGE = AgentCheck.gauge
+RATE = AgentCheck.rate
+HISTORATE = AgentCheck.generate_historate_func(["container_name"])
+HISTO = AgentCheck.generate_histogram_func(["container_name"])
+FUNC_MAP = {
+    GAUGE: {True: HISTO, False: GAUGE},
+    RATE: {True: HISTORATE, False: RATE}
+}
+
 CONTAINER_LABELS = [
     'container_name',  # kubernetes container name
     'id',  # cgroup path
@@ -26,6 +41,7 @@ CONTAINER_LABELS_TO_TAGS = {
     'image': 'container_image',
 }
 
+
 class KubeletCheck(PrometheusCheck):
     """
     Collect Kubelet metrics
@@ -39,7 +55,9 @@ class KubeletCheck(PrometheusCheck):
         except Exception as ex:
             raise CheckException("Couldn't instantiate the Kubernetes client. Error: %s" % str(ex))
 
-        self.metrics_mapper = {}
+        self.metrics_mapper = {
+            'kubelet_runtime_operations_errors': 'kubelet.runtime.errors',
+        }
         self.ignore_metrics = {}
 
         # these are filled by container_<metric-name>_usage_<metric-unit>
@@ -51,6 +69,10 @@ class KubeletCheck(PrometheusCheck):
         self.kube_pod_tags = {}
 
     def check(self, instance):
+        self.use_histogram = _is_affirmative(instance.get('use_histogram', DEFAULT_USE_HISTOGRAM))
+        self.publish_rate = FUNC_MAP[RATE][self.use_histogram]
+        self.publish_gauge = FUNC_MAP[GAUGE][self.use_histogram]
+
         endpoint = instance.get('prometheus_endpoint')
         if endpoint is None:
             raise CheckException("Unable to find prometheus_endpoint in config file.")
@@ -67,7 +89,38 @@ class KubeletCheck(PrometheusCheck):
         except Exception as e:
             self.log.warning('Could not retrieve kubernetes tags: %s' % str(e))
 
+        try:
+            pods_list = self.kubeutil.retrieve_pods_list()
+        except:
+            pods_list = None
+
+        self._report_pods_running(pods_list, instance.get('tags', []))
         self.process(endpoint, send_histograms_buckets=send_buckets, instance=instance)
+
+    def _report_pods_running(self, pods, instance_tags):
+        """
+        Reports the number of running pods on this node
+        tagged by service and creator.
+        """
+        tags_map = defaultdict(int)
+        for pod in pods['items']:
+            pod_meta = pod.get('metadata', {})
+            pod_tags = instance_tags
+            pod_tags += self.kubeutil.get_pod_creator_tags(pod_meta)
+            if 'namespace' in pod_meta:
+                pod_tags.append('kube_namespace:%s' % pod_meta['namespace'])
+            if self.collect_service_tag:
+                services = self.kubeutil.match_services_for_pod(pod_meta)
+                if isinstance(services, list):
+                    for service in services:
+                        pod_tags.append('kube_service:%s' % service)
+
+            tags_map[frozenset(pod_tags)] += 1
+
+        for pod_tags, pod_count in tags_map.iteritems():
+            tags = list(pod_tags)
+            self.publish_gauge(self, self.NAMESPACE + '.pods.running', pod_count, tags)
+
 
     def _is_container_metric(self, metric):
         """
@@ -84,6 +137,20 @@ class KubeletCheck(PrometheusCheck):
             elif l not in [ml.name for ml in metric.label]:
                 return False
         return True
+
+    def _is_pod_metric(self, metric):
+        """
+        Return whether a metric is about a pod or not.
+        It can be about pods, or even higher levels in the cgroup hierarchy
+        and we don't want to report on that.
+        """
+        for l in CONTAINER_LABELS:
+            if l == 'container_name':
+                for ml in metric.label:
+                    if ml.name == l:
+                        if ml.value == 'POD':
+                            return True
+        return False
 
     def _extract_image_tags(self, image_label):
         """Get the image tags using dockerutil"""
@@ -110,10 +177,8 @@ class KubeletCheck(PrometheusCheck):
                 tags += self._extract_image_tags(label.value)
             elif label.name == "pod_name":
                 pname = label.value
-                tags.append('pod_name:%s' % pname)
             elif label.name == 'namespace':
                 ns = label.value
-                tags.append('namespace:%s' % ns)
             else:
                 if label.name in CONTAINER_LABELS_TO_TAGS:
                     tags.append('{}:{}'.format(CONTAINER_LABELS_TO_TAGS[label.name], label.value))
@@ -235,18 +300,50 @@ class KubeletCheck(PrometheusCheck):
                 else:
                     self.log.debug("No mem usage found for container %s, skipping usage_pct for now." % c_name)
 
-    # def container_network_receive_bytes_total(self, message, **kwargs):
-    #     metric_name = self.NAMESPACE + '.network.rx_bytes'
-    #     pass
+    def container_network_receive_bytes_total(self, message, **kwargs):
+        metric_name = self.NAMESPACE + '.network.rx_bytes'
+        if message.type >= len(METRIC_TYPES):
+            self.log.error("Metric type %s unsupported for metric %s" % (message.type, message.name))
+            return
 
-    # def container_network_transmit_bytes_total(self, message, **kwargs):
-    #     metric_name = self.NAMESPACE + '.network.tx_bytes'
-    #     pass
+        for metric in message.metric:
+            if self._is_pod_metric(metric):
+                tags = self._extract_metric_tags(metric.label)
+                val = getattr(metric, METRIC_TYPES[message.type]).value
+                self.rate(metric_name, val, tags)
 
-    # def container_network_receive_errors_total(self, message, **kwargs):
-    #     metric_name = self.NAMESPACE + '.network.rx_errors'
-    #     pass
+    def container_network_transmit_bytes_total(self, message, **kwargs):
+        metric_name = self.NAMESPACE + '.network.tx_bytes'
+        if message.type >= len(METRIC_TYPES):
+            self.log.error("Metric type %s unsupported for metric %s" % (message.type, message.name))
+            return
 
-    # def container_network_transmit_errors_total(self, message, **kwargs):
-    #     metric_name = self.NAMESPACE + '.network.tx_errors'
-    #     pass
+        for metric in message.metric:
+            if self._is_pod_metric(metric):
+                tags = self._extract_metric_tags(metric.label)
+                val = getattr(metric, METRIC_TYPES[message.type]).value
+                self.rate(metric_name, val, tags)
+
+    def container_network_receive_errors_total(self, message, **kwargs):
+        metric_name = self.NAMESPACE + '.network.rx_errors'
+        if message.type >= len(METRIC_TYPES):
+            self.log.error("Metric type %s unsupported for metric %s" % (message.type, message.name))
+            return
+
+        for metric in message.metric:
+            if self._is_pod_metric(metric):
+                tags = self._extract_metric_tags(metric.label)
+                val = getattr(metric, METRIC_TYPES[message.type]).value
+                self.rate(metric_name, val, tags)
+
+    def container_network_transmit_errors_total(self, message, **kwargs):
+        metric_name = self.NAMESPACE + '.network.tx_errors'
+        if message.type >= len(METRIC_TYPES):
+            self.log.error("Metric type %s unsupported for metric %s" % (message.type, message.name))
+            return
+
+        for metric in message.metric:
+            if self._is_pod_metric(metric):
+                tags = self._extract_metric_tags(metric.label)
+                val = getattr(metric, METRIC_TYPES[message.type]).value
+                self.rate(metric_name, val, tags)
