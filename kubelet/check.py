@@ -3,7 +3,9 @@
 # Licensed under Simplified BSD License (see LICENSE)
 
 # stdlib
+import calendar
 import re
+import time
 from collections import defaultdict
 
 # project
@@ -12,8 +14,14 @@ from checks.prometheus_check import PrometheusCheck
 from config import _is_affirmative
 from utils.dockerutil import DockerUtil
 from utils.kubernetes.kubeutil import KubeUtil
+from utils.service_discovery.sd_backend import get_sd_backend
 
 METRIC_TYPES = ['counter', 'gauge', 'summary']
+
+DEFAULT_COLLECT_EVENTS = False
+DEFAULT_SERVICE_EVENT_FREQ = 5 * 60  # seconds
+DEFAULT_NAMESPACES = ['default']
+EVENT_TYPE = 'kubernetes'
 
 GAUGE = AgentCheck.gauge
 RATE = AgentCheck.rate
@@ -31,34 +39,23 @@ FUNC_MAP = {
     RATE: {True: HISTORATE, False: RATE}
 }
 
-CONTAINER_LABELS = [
-    'container_name',  # kubernetes container name
-    'id',  # cgroup path
-    'image',
-    'name',  # docker container name
-    'namespace',  # kubernetes namespace
-    'pod_name'
-]
-
-CONTAINER_LABELS_TO_TAGS = {
-    'container_name': 'kube_container_name',
-    'namespace': 'kube_namespace',
-    'pod_name': 'pod_name',
-    'name': 'container_name',
-    'image': 'container_image',
-}
-
 
 class KubeletCheck(PrometheusCheck):
     """
     Collect Kubelet metrics
     TODO:
-    - handle events (other check?)
     - handle custom cAdvisor metrics (see _update_metrics chain)
+    - merge with kubernetes check
+    - can we do major check version & break retro-comp?
     """
     def __init__(self, name, init_config, agentConfig, instances=None):
         super(KubeletCheck, self).__init__(name, init_config, agentConfig, instances)
         self.NAMESPACE = 'kubernetes'
+
+        if instances is not None and len(instances) > 1:
+            raise Exception('Kubernetes check only supports one configured instance.')
+        inst = instances[0] if instances else None
+
         self.dockerutil = DockerUtil()
         try:
             self.kubeutil = KubeUtil()
@@ -77,6 +74,37 @@ class KubeletCheck(PrometheusCheck):
 
         # pod --> tags map
         self.kube_pod_tags = {}
+
+        # auto discovery
+        if agentConfig.get('service_discovery') and \
+           agentConfig.get('service_discovery_backend') == 'docker':
+            self._sd_backend = get_sd_backend(agentConfig)
+        else:
+            self._sd_backend = None
+
+        # event collection & service tagging
+        self.k8s_namespace_regexp = None
+        if inst:
+            regexp = inst.get('namespace_name_regexp', None)
+            if regexp:
+                try:
+                    self.k8s_namespace_regexp = re.compile(regexp)
+                except re.error as ex:
+                    self.log.warning('Invalid regexp for "namespace_name_regexp" in configuration (ignoring regexp): %s' % str(ex))
+
+            self._collect_events = _is_affirmative(inst.get('collect_events', DEFAULT_COLLECT_EVENTS))
+            if self._collect_events:
+                self.event_retriever = self.kubeutil.get_event_retriever()
+            elif self.kubeutil.collect_service_tag:
+                # Only fetch service and pod events for service mapping
+                event_delay = inst.get('service_tag_update_freq', DEFAULT_SERVICE_EVENT_FREQ)
+                self.event_retriever = self.kubeutil.get_event_retriever(kinds=['Service', 'Pod'],
+                                                                         delay=event_delay)
+            else:
+                self.event_retriever = None
+        else:
+            self._collect_events = None
+            self.event_retriever = None
 
     def check(self, instance):
         self.use_histogram = _is_affirmative(instance.get('use_histogram', DEFAULT_USE_HISTOGRAM))
@@ -100,22 +128,35 @@ class KubeletCheck(PrometheusCheck):
             self.log.warning('Could not retrieve kubernetes tags: %s' % str(e))
 
         try:
-            pods_list = self.kubeutil.retrieve_pods_list()
+            pod_list = self.kubeutil.retrieve_pods_list()
         except:
-            pods_list = None
+            pod_list = None
 
-        self._report_node_metrics(instance)
-        self._perform_kubelet_check(instance)
-        self._report_pods_running(pods_list, instance.get('tags', []))
+        instance_tags = instance.get('tags', [])
+        self._report_node_metrics(instance_tags)
+        self._perform_kubelet_check(instance_tags)
+        self._report_pods_running(pod_list, instance_tags)
         self.process(endpoint, send_histograms_buckets=send_buckets, instance=instance)
 
-    def _report_node_metrics(self, instance):
+        # events
+        if self.event_retriever is not None:
+            try:
+                events = self.event_retriever.get_event_array()
+                changed_cids = self.kubeutil.process_events(events, podlist=pod_list)
+                if (changed_cids and self._sd_backend):
+                    self._sd_backend.update_checks(changed_cids)
+                if events and self._collect_events:
+                    self._update_kube_events(instance, events)
+            except Exception as ex:
+                self.log.error("Event collection failed: %s" % str(ex))
+
+    def _report_node_metrics(self, instance_tags):
         machine_info = self.kubeutil.retrieve_machine_info()
         num_cores = machine_info.get('num_cores', 0)
         memory_capacity = machine_info.get('memory_capacity', 0)
         pod_capacity = machine_info.get('pods')
 
-        tags = instance.get('tags', [])
+        tags = instance_tags
         self.publish_gauge(self, self.NAMESPACE + '.cpu.capacity', float(num_cores), tags)
         self.publish_gauge(self, self.NAMESPACE + '.memory.capacity', float(memory_capacity), tags)
 
@@ -131,7 +172,8 @@ class KubeletCheck(PrometheusCheck):
             except Exception as ex:
                 self.log.warning("Failed to report metric %s. Err: %s" % (m_name, str(ex)))
 
-    def _perform_kubelet_check(self, instance):
+    def _perform_kubelet_check(self, instance_tags):
+        """Runs local service checks"""
         service_check_base = self.NAMESPACE + '.kubelet.check'
         is_ok = True
         url = self.kubeutil.kube_health_url
@@ -150,20 +192,20 @@ class KubeletCheck(PrometheusCheck):
                 service_check_name = service_check_base + '.' + matches.group(2)
                 status = matches.group(1)
                 if status == '+':
-                    self.service_check(service_check_name, AgentCheck.OK, tags=instance.get('tags', []))
+                    self.service_check(service_check_name, AgentCheck.OK, tags=instance_tags)
                 else:
-                    self.service_check(service_check_name, AgentCheck.CRITICAL, tags=instance.get('tags', []))
+                    self.service_check(service_check_name, AgentCheck.CRITICAL, tags=instance_tags)
                     is_ok = False
 
         except Exception as e:
             self.log.warning('kubelet check %s failed: %s' % (url, str(e)))
             self.service_check(service_check_base, AgentCheck.CRITICAL,
-                               message='Kubelet check %s failed: %s' % (url, str(e)), tags=instance.get('tags', []))
+                               message='Kubelet check %s failed: %s' % (url, str(e)), tags=instance_tags)
         else:
             if is_ok:
-                self.service_check(service_check_base, AgentCheck.OK, tags=instance.get('tags', []))
+                self.service_check(service_check_base, AgentCheck.OK, tags=instance_tags)
             else:
-                self.service_check(service_check_base, AgentCheck.CRITICAL, tags=instance.get('tags', []))
+                self.service_check(service_check_base, AgentCheck.CRITICAL, tags=instance_tags)
 
     def _report_pods_running(self, pods, instance_tags):
         """
@@ -192,70 +234,6 @@ class KubeletCheck(PrometheusCheck):
             tags = list(tags)
             self.publish_gauge(self, self.NAMESPACE + '.pods.running', count, tags)
 
-    def _is_container_metric(self, metric):
-        """
-        Return whether a metric is about a container or not.
-        It can be about pods, or even higher levels in the cgroup hierarchy
-        and we don't want to report on that.
-        """
-        for l in CONTAINER_LABELS:
-            if l == 'container_name':
-                for ml in metric.label:
-                    if ml.name == l:
-                        if ml.value == 'POD':
-                            return False
-            elif l not in [ml.name for ml in metric.label]:
-                return False
-        return True
-
-    def _is_pod_metric(self, metric):
-        """
-        Return whether a metric is about a pod or not.
-        It can be about pods, or even higher levels in the cgroup hierarchy
-        and we don't want to report on that.
-        """
-        for l in CONTAINER_LABELS:
-            if l == 'container_name':
-                for ml in metric.label:
-                    if ml.name == l:
-                        if ml.value == 'POD':
-                            return True
-        return False
-
-    def _extract_image_tags(self, image_label):
-        """Get the image tags using dockerutil"""
-        tags = []
-        # These extracters expect a container dict.
-        # We pass them one with the only info they need
-        dummy_container = {'Image': image_label}
-        docker_image = self.dockerutil.image_name_extractor(dummy_container)
-        image_name_array = self.dockerutil.image_tag_extractor(dummy_container, 0)
-        image_tag_array = self.dockerutil.image_tag_extractor(dummy_container, 1)
-        if docker_image:
-            tags.append('container_image:%s' % docker_image)
-        if image_name_array and len(image_name_array) > 0:
-            tags.append('image_name:%s' % image_name_array[0])
-        if image_tag_array and len(image_tag_array) > 0:
-            tags.append('image_tag:%s' % image_tag_array[0])
-        return tags
-
-    def _extract_metric_tags(self, labels):
-        tags = []
-        pname, ns = None, None
-        for label in labels:
-            if label.name == 'image':
-                tags += self._extract_image_tags(label.value)
-            elif label.name == "pod_name":
-                pname = label.value
-            elif label.name == 'namespace':
-                ns = label.value
-            else:
-                if label.name in CONTAINER_LABELS_TO_TAGS:
-                    tags.append('{}:{}'.format(CONTAINER_LABELS_TO_TAGS[label.name], label.value))
-            if pname and ns:
-                tags += self.kube_pod_tags.get('{}/{}'.format(ns, pname), [])
-        return tags
-
     def container_cpu_usage_seconds_total(self, message, **kwargs):
         metric_name = self.NAMESPACE + '.cpu.usage.total'
         if message.type >= len(METRIC_TYPES):
@@ -264,13 +242,13 @@ class KubeletCheck(PrometheusCheck):
 
         for metric in message.metric:
             if self._is_container_metric(metric):
-                tags = self._extract_metric_tags(metric.label)
+                tags = self.kubeutil.extract_metric_tags(metric.label)
                 val = getattr(metric, METRIC_TYPES[message.type]).value
                 self.publish_rate(self, metric_name, val, tags)
 
     def _process_usage_metric(self, m_name, message, cache):
         """
-        takes a metrics message, a metric name, and a cache dict where it will store
+        Takes a metrics message, a metric name, and a cache dict where it will store
         container_name --> (value, tags) so that _process_limit_metric can compute usage_pct
         it also submit said value and tags as a gauge.
         """
@@ -278,7 +256,7 @@ class KubeletCheck(PrometheusCheck):
         seen_keys = {k: False for k in cache}
         for metric in message.metric:
             if self._is_container_metric(metric):
-                tags = self._extract_metric_tags(metric.label)
+                tags = self.kubeutil.extract_metric_tags(metric.label)
                 c_name = None
                 for t in tags:
                     if t.split(':', 1)[0] == 'container_name':
@@ -297,14 +275,14 @@ class KubeletCheck(PrometheusCheck):
 
     def _process_limit_metric(self, m_name, message, cache, pct_m_name=None):
         """
-        reports limit metrics if m_name is not an empty string,
+        Reports limit metrics if m_name is not an empty string,
         and optionally checks in the given cache if there's a usage
         for each metric in the message and reports the usage_pct
         """
         for metric in message.metric:
             if self._is_container_metric(metric):
                 limit = getattr(metric, METRIC_TYPES[message.type]).value
-                tags = self._extract_metric_tags(metric.label)
+                tags = self.kubeutil.extract_metric_tags(metric.label)
 
                 if m_name:
                     self.publish_gauge(self, m_name, limit, tags)
@@ -378,7 +356,7 @@ class KubeletCheck(PrometheusCheck):
 
         for metric in message.metric:
             if self._is_pod_metric(metric):
-                tags = self._extract_metric_tags(metric.label)
+                tags = self.kubeutil.extract_metric_tags(metric.label)
                 val = getattr(metric, METRIC_TYPES[message.type]).value
                 self.publish_rate(self, metric_name, val, tags)
 
@@ -390,7 +368,7 @@ class KubeletCheck(PrometheusCheck):
 
         for metric in message.metric:
             if self._is_pod_metric(metric):
-                tags = self._extract_metric_tags(metric.label)
+                tags = self.kubeutil.extract_metric_tags(metric.label)
                 val = getattr(metric, METRIC_TYPES[message.type]).value
                 self.publish_rate(self, metric_name, val, tags)
 
@@ -402,7 +380,7 @@ class KubeletCheck(PrometheusCheck):
 
         for metric in message.metric:
             if self._is_pod_metric(metric):
-                tags = self._extract_metric_tags(metric.label)
+                tags = self.kubeutil.extract_metric_tags(metric.label)
                 val = getattr(metric, METRIC_TYPES[message.type]).value
                 self.publish_rate(self, metric_name, val, tags)
 
@@ -414,6 +392,41 @@ class KubeletCheck(PrometheusCheck):
 
         for metric in message.metric:
             if self._is_pod_metric(metric):
-                tags = self._extract_metric_tags(metric.label)
+                tags = self.kubeutil.extract_metric_tags(metric.label)
                 val = getattr(metric, METRIC_TYPES[message.type]).value
                 self.publish_rate(self, metric_name, val, tags)
+
+    def _update_kube_events(self, instance, event_items):
+        """Process kubernetes events"""
+        node_ip, node_name = self.kubeutil.get_node_info()
+        self.log.debug('Processing events on {} [{}]'.format(node_name, node_ip))
+
+        k8s_namespaces = self.kubeutil.get_namespaces(instance, self.k8s_namespace_regexp)
+        for event in event_items:
+            event_ts = calendar.timegm(time.strptime(event.get('lastTimestamp'), '%Y-%m-%dT%H:%M:%SZ'))
+            involved_obj = event.get('involvedObject', {})
+
+            # filter events by white listed namespaces (empty namespace belong to the 'default' one)
+            if involved_obj.get('namespace', 'default') not in k8s_namespaces:
+                continue
+
+            tags = self.kubeutil.extract_event_tags(event)
+            tags.extend(instance.get('tags', []))
+
+            title = '{} {} on {}'.format(involved_obj.get('name'), event.get('reason'), node_name)
+            message = event.get('message')
+            source = event.get('source')
+            if source:
+                message += '\nSource: {} {}\n'.format(source.get('component', ''), source.get('host', ''))
+            msg_body = "%%%\n{}\n```\n{}\n```\n%%%".format(title, message)
+            dd_event = {
+                'timestamp': event_ts,
+                'host': node_ip,
+                'event_type': EVENT_TYPE,
+                'msg_title': title,
+                'msg_text': msg_body,
+                'source_type_name': EVENT_TYPE,
+                'event_object': 'kubernetes:{}'.format(involved_obj.get('name')),
+                'tags': tags,
+            }
+            self.event(dd_event)

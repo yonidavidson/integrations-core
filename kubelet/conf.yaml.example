@@ -22,3 +22,31 @@ instances:
     # Defaults to false
     #
     # use_histogram: true
+    #
+    #
+    # collect_events controls whether the agent should fetch events from the kubernetes API and
+    # ingest them in Datadog. To avoid duplicates, only one agent at a time across the entire
+    # cluster should have this feature enabled. To enable the feature, set the parameter to `true`.
+    #
+    # collect_events: false
+    #
+    # Matching the pods to Kubernetes services requires to retrieve events regularly.
+    # To reduce the traffic to the apiserver, we only query them every 5 minutes, adding a delay
+    # in pod -> service matching. You can configure it below (in seconds) or disable kube_service
+    # tagging completely
+    #
+    # collect_service_tags: true
+    # service_tag_update_freq: 300
+    #
+    # The namespaces for which events should be collected.
+    # If not modified, the 'default' namespace will be used.
+    #
+    # namespaces:
+    #  - default
+    #
+    # The regexp used to select namespaces for which events should be collected.
+    # The matched namespaces will be added to the "namespaces" list.
+    # If empty, regexp selection will be ignored.
+    #
+    # namespace_name_regexp:
+
