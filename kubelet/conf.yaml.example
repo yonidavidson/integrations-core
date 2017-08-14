@@ -1,16 +1,24 @@
 init_config:
 
 instances:
-    # url of the metrics endpoint of prometheus
-  - prometheus_endpoint: http://10.8.0.1:10255/metrics
+    # url of the kubelet metrics endpoint
+  - metrics_endpoint: http://10.8.0.1:10255/metrics
+    #
     # The histogram buckets can be noisy and generate a lot of tags.
     # send_histograms_buckets controls whether or not you want to pull them.
     #
     # send_histograms_buckets: True
     #
-    # Note that like all checks based on the PrometheusCheck class, you can add
-    # tags to the instance that will be added to all the metrics of this check
-    # instance.
+    # Like all checks based on the PrometheusCheck class, you can add tags
+    # to the instance that will be added to all the metrics of this check instance.
     #
     # tags:
     #   - 'mytag1:myValue1'
+    #
+    # use_histogram controls whether we send detailed metrics, i.e. one per container.
+    # When false, we send detailed metrics corresponding to individual
+    # containers, tagging by container id to keep them unique.
+    # When true, we aggregate data based on container image.
+    # Defaults to false
+    #
+    # use_histogram: true
