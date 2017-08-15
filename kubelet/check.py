@@ -136,6 +136,7 @@ class KubeletCheck(PrometheusCheck):
         self._report_node_metrics(instance_tags)
         self._perform_kubelet_check(instance_tags)
         self._report_pods_running(pod_list, instance_tags)
+        self._report_container_spec_metrics(pod_list, instance_tags)
         self.process(endpoint, send_histograms_buckets=send_buckets, instance=instance)
 
         # events
@@ -149,6 +150,41 @@ class KubeletCheck(PrometheusCheck):
                     self._update_kube_events(instance, events)
             except Exception as ex:
                 self.log.error("Event collection failed: %s" % str(ex))
+
+    def _report_container_spec_metrics(self, pod_list, instance_tags):
+        for pod in pod_list['items']:
+            for ctr in pod['spec']['containers']:
+                if ctr['resources']:
+                    c_name = ctr['name']
+                    _tags = [
+                        'container_image',
+                        'image_name',
+                        'image_tag',
+                        'pod_name',  # if it's no pod, drop it
+                        'kube_namespace'
+                        'kube_container_name'
+                    ]
+                    kube_labels_key = "{0}/{1}".format(pod_namespace, pod_name)
+
+                    pod_labels = kube_labels.get(kube_labels_key)
+                    if pod_labels:
+                        tags += list(pod_labels)
+
+                    creator stuff
+
+                    try:
+                        for resource, value_str in ctr.get('resources', {}).get('requests', {}).iteritems():
+                            value = self.kubeutil.parse_quantity(value_str)
+                            self.publish_gauge(self, '{}.{}.requests'.format(self.NAMESPACE, resource), value, _tags)
+                    except (KeyError, AttributeError) as e:
+                        self.log.debug("Unable to retrieve container requests for %s: %s", c_name, e)
+
+                    try:
+                        for resource, value_str in ctr.get('resources', {}).get('limits', {}).iteritems():
+                            value = self.kubeutil.parse_quantity(value_str)
+                            self.publish_gauge(self, '{}.{}.limits'.format(self.NAMESPACE, resource), value, _tags)
+                    except (KeyError, AttributeError) as e:
+                        self.log.debug("Unable to retrieve container limits for %s: %s", c_name, e)
 
     def _report_node_metrics(self, instance_tags):
         machine_info = self.kubeutil.retrieve_machine_info()
