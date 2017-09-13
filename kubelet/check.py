@@ -12,7 +12,6 @@ from collections import defaultdict
 from checks import AgentCheck, CheckException
 from checks.prometheus_check import PrometheusCheck
 from config import _is_affirmative
-from utils.dockerutil import DockerUtil
 from utils.kubernetes.kubeutil import KubeUtil
 from utils.service_discovery.sd_backend import get_sd_backend
 
@@ -22,6 +21,16 @@ DEFAULT_COLLECT_EVENTS = False
 DEFAULT_SERVICE_EVENT_FREQ = 5 * 60  # seconds
 DEFAULT_NAMESPACES = ['default']
 EVENT_TYPE = 'kubernetes'
+LEADER_CANDIDATE = 'leader_candidate'
+
+CONTAINER_LABELS_TO_TAGS = {
+    'container_name': 'kube_container_name',  # kubernetes container name
+    'namespace': 'kube_namespace',  # kubernetes namespace
+    'pod_name': 'pod_name',
+    'name': 'container_name',  # docker container name
+    'image': 'container_image',
+    'id': None,  # cgroup path
+}
 
 GAUGE = AgentCheck.gauge
 RATE = AgentCheck.rate
@@ -29,8 +38,8 @@ RATE = AgentCheck.rate
 # if histograms are used instead of exact metrics
 # HISTO and HISTORATE are used instead of gauge and rate
 # and they exclude the container_name tag, greatly decreasing the
-# tag count, and making the drop-down menu in the app
-# much quicker to load for the impacted metrics.
+# tag count, and making dashboards and drop-down menu in the app
+# much faster to load for the impacted metrics.
 DEFAULT_USE_HISTOGRAM = False
 HISTORATE = AgentCheck.generate_historate_func(["container_name"])
 HISTO = AgentCheck.generate_histogram_func(["container_name"])
@@ -42,25 +51,30 @@ FUNC_MAP = {
 
 class KubeletCheck(PrometheusCheck):
     """
-    Collect Kubelet metrics
+    Collect container metrics from Kubelet.
+    Custom container metrics are not supported anymore as kubelet in Kubernetes 1.6+
+    switched to the CRI implementation which does not expose custom metrics.
+
     TODO:
-    - handle custom cAdvisor metrics (see _update_metrics chain)
     - merge with kubernetes check
     - can we do major check version & break retro-comp?
     """
     def __init__(self, name, init_config, agentConfig, instances=None):
         super(KubeletCheck, self).__init__(name, init_config, agentConfig, instances)
-        self.NAMESPACE = 'kubernetes'
+        self.NAMESPACE = 'kubelet'
 
         if instances is not None and len(instances) > 1:
             raise Exception('Kubernetes check only supports one configured instance.')
         inst = instances[0] if instances else None
 
-        self.dockerutil = DockerUtil()
-        try:
-            self.kubeutil = KubeUtil()
-        except Exception as ex:
-            raise CheckException("Couldn't instantiate the Kubernetes client. Error: %s" % str(ex))
+        self.kubeutil = KubeUtil(init_config=init_config, instance=inst)
+
+        if not self.kubeutil.init_success:
+            if self.kubeutil.left_init_retries > 0:
+                self.log.warning("Kubelet client failed to initialized, pausing the Kubernetes check.")
+            else:
+                raise Exception('Unable to initialize Kubelet client. Try setting '
+                                'the host parameter. The Kubernetes check failed permanently.')
 
         self.metrics_mapper = {
             'kubelet_runtime_operations_errors': 'kubelet.runtime.errors',
@@ -72,7 +86,7 @@ class KubeletCheck(PrometheusCheck):
         self.fs_usage_bytes = {}
         self.mem_usage_bytes = {}
 
-        # pod --> tags map
+        # pod_name --> tags map
         self.kube_pod_tags = {}
 
         # auto discovery
@@ -81,6 +95,11 @@ class KubeletCheck(PrometheusCheck):
             self._sd_backend = get_sd_backend(agentConfig)
         else:
             self._sd_backend = None
+
+        # leader election
+        self.leader_candidate = inst.get(LEADER_CANDIDATE)
+        if self.leader_candidate:
+            self.kubeutil.refresh_leader()
 
         # event collection & service tagging
         self.k8s_namespace_regexp = None
@@ -92,21 +111,43 @@ class KubeletCheck(PrometheusCheck):
                 except re.error as ex:
                     self.log.warning('Invalid regexp for "namespace_name_regexp" in configuration (ignoring regexp): %s' % str(ex))
 
-            self._collect_events = _is_affirmative(inst.get('collect_events', DEFAULT_COLLECT_EVENTS))
-            if self._collect_events:
+            self.event_retriever = None
+            self._configure_event_collection(inst)
+
+    def _configure_event_collection(self, instance):
+        self._collect_events = self.kubeutil.is_leader or _is_affirmative(
+            instance.get('collect_events', DEFAULT_COLLECT_EVENTS))
+        if self._collect_events:
+            if self.event_retriever:
+                self.event_retriever.set_kinds(None)
+                self.event_retriever.set_delay(None)
+            else:
                 self.event_retriever = self.kubeutil.get_event_retriever()
-            elif self.kubeutil.collect_service_tag:
-                # Only fetch service and pod events for service mapping
-                event_delay = inst.get('service_tag_update_freq', DEFAULT_SERVICE_EVENT_FREQ)
+        elif self.kubeutil.collect_service_tag:
+            # Only fetch service and pod events for service mapping
+            event_delay = instance.get('service_tag_update_freq', DEFAULT_SERVICE_EVENT_FREQ)
+            if self.event_retriever:
+                self.event_retriever.set_kinds(['Service', 'Pod'])
+                self.event_retriever.set_delay(event_delay)
+            else:
                 self.event_retriever = self.kubeutil.get_event_retriever(kinds=['Service', 'Pod'],
                                                                          delay=event_delay)
-            else:
-                self.event_retriever = None
         else:
-            self._collect_events = None
             self.event_retriever = None
 
     def check(self, instance):
+        if not self.kubeutil.init_success:
+            if self.kubeutil.left_init_retries > 0:
+                self.kubeutil.init_kubelet(instance)
+                self.log.warning("Kubelet client is not initialized, Kubernetes check is paused.")
+                return
+            else:
+                raise Exception("Unable to initialize Kubelet client. Try setting the "
+                                "host parameter. The Kubernetes check failed permanently.")
+
+        # Leader election
+        self.refresh_leader_status(instance)
+
         self.use_histogram = _is_affirmative(instance.get('use_histogram', DEFAULT_USE_HISTOGRAM))
         self.publish_rate = FUNC_MAP[RATE][self.use_histogram]
         self.publish_gauge = FUNC_MAP[GAUGE][self.use_histogram]
@@ -123,14 +164,14 @@ class KubeletCheck(PrometheusCheck):
             send_buckets = True
 
         try:
-            self.kube_pod_tags = self.kubeutil.get_kube_pod_tags()
-        except Exception as e:
-            self.log.warning('Could not retrieve kubernetes tags: %s' % str(e))
-
-        try:
             pod_list = self.kubeutil.retrieve_pods_list()
         except:
             pod_list = None
+
+        try:
+            self.kube_pod_tags = self.kubeutil.extract_kube_pod_tags(pod_list)
+        except Exception as e:
+            self.log.warning('Could not retrieve kubernetes tags: %s' % str(e))
 
         instance_tags = instance.get('tags', [])
         self._report_node_metrics(instance_tags)
@@ -152,39 +193,60 @@ class KubeletCheck(PrometheusCheck):
                 self.log.error("Event collection failed: %s" % str(ex))
 
     def _report_container_spec_metrics(self, pod_list, instance_tags):
+        """Reports pod requests & limits by looking at pod specs."""
         for pod in pod_list['items']:
+            pod_meta = pod.get('metadata', {})
+            pod_ns, pod_name = pod_meta.get('namespace'), pod_meta.get('name')
+
+            if not pod_name:
+                continue
+
             for ctr in pod['spec']['containers']:
-                if ctr['resources']:
-                    c_name = ctr['name']
-                    _tags = [
-                        'container_image',
-                        'image_name',
-                        'image_tag',
-                        'pod_name',  # if it's no pod, drop it
-                        'kube_namespace'
-                        'kube_container_name'
-                    ]
-                    kube_labels_key = "{0}/{1}".format(pod_namespace, pod_name)
+                if not ctr.get('resources'):
+                    continue
 
-                    pod_labels = kube_labels.get(kube_labels_key)
-                    if pod_labels:
-                        tags += list(pod_labels)
+                tags = [
+                    'pod_name:%s' % pod_name,
+                    'kube_namespace:%s' % pod_ns
+                ]
 
-                    creator stuff
+                c_name = ctr.get('name')
+                if c_name:
+                    tags.append('kube_container_name:%s' % c_name)
 
-                    try:
-                        for resource, value_str in ctr.get('resources', {}).get('requests', {}).iteritems():
-                            value = self.kubeutil.parse_quantity(value_str)
-                            self.publish_gauge(self, '{}.{}.requests'.format(self.NAMESPACE, resource), value, _tags)
-                    except (KeyError, AttributeError) as e:
-                        self.log.debug("Unable to retrieve container requests for %s: %s", c_name, e)
+                c_image = ctr.get('image')
+                if c_image:
+                    tags.append('container_image:%s' % c_image)
 
-                    try:
-                        for resource, value_str in ctr.get('resources', {}).get('limits', {}).iteritems():
-                            value = self.kubeutil.parse_quantity(value_str)
-                            self.publish_gauge(self, '{}.{}.limits'.format(self.NAMESPACE, resource), value, _tags)
-                    except (KeyError, AttributeError) as e:
-                        self.log.debug("Unable to retrieve container limits for %s: %s", c_name, e)
+                split = c_image.split(":")
+                if len(split) > 2:
+                    # if the repo is in the image name and has the form 'docker.clearbit:5000'
+                    # the split will be like [repo_url, repo_port/image_name, image_tag]. Let's avoid that
+                    split = [':'.join(split[:-1]), split[-1]]
+
+                tags.append('image_name:%s' % split[0])
+                if len(split) == 2:
+                    tags.append('image_tag:%s' % split[1])
+
+                pod_labels = pod_meta.get('labels', {})
+                if pod_labels:
+                    tags += map(lambda x: '%s:%s' % (x[0], x[1]), pod_labels.iteritems())
+
+                tags += list(self.kubeutil.get_pod_creator_tags(pod_meta))
+
+                try:
+                    for resource, value_str in ctr.get('resources', {}).get('requests', {}).iteritems():
+                        value = self.kubeutil.parse_quantity(value_str)
+                        self.publish_gauge(self, '{}.{}.requests'.format(self.NAMESPACE, resource), value, tags)
+                except (KeyError, AttributeError) as e:
+                    self.log.debug("Unable to retrieve container requests for %s: %s", c_name, e)
+
+                try:
+                    for resource, value_str in ctr.get('resources', {}).get('limits', {}).iteritems():
+                        value = self.kubeutil.parse_quantity(value_str)
+                        self.publish_gauge(self, '{}.{}.limits'.format(self.NAMESPACE, resource), value, tags)
+                except (KeyError, AttributeError) as e:
+                    self.log.debug("Unable to retrieve container limits for %s: %s", c_name, e)
 
     def _report_node_metrics(self, instance_tags):
         machine_info = self.kubeutil.retrieve_machine_info()
@@ -263,14 +325,67 @@ class KubeletCheck(PrometheusCheck):
                 if isinstance(services, list):
                     for service in services:
                         pod_tags.append('kube_service:%s' % service)
-
             tags_map[frozenset(pod_tags)] += 1
 
         for tags, count in tags_map.iteritems():
             tags = list(tags)
             self.publish_gauge(self, self.NAMESPACE + '.pods.running', count, tags)
 
+    def _is_pod_metric(self, metric):
+        """
+        Return whether a metric is about a pod or not.
+        It can be about pods, or even higher levels in the cgroup hierarchy
+        and we don't want to report on that.
+        """
+        for ml in metric.label:
+            if ml.name == 'container_name' and ml.value == 'POD':
+                return True
+            # container_cpu_usage_seconds_total has an id label that is a cgroup path
+            # eg: /kubepods/burstable/pod531c80d9-9fc4-11e7-ba8b-42010af002bb
+            # FIXME: this was needed because of a bug:
+            # https://github.com/kubernetes/kubernetes/pull/51473
+            # starting from k8s 1.8 we can remove this
+            elif ml.name == 'id' and ml.value.split('/')[-1].startswith('pod'):
+                return True
+        return False
+
+    def _is_container_metric(self, metric):
+        """
+        Return whether a metric is about a container or not.
+        It can be about pods, or even higher levels in the cgroup hierarchy
+        and we don't want to report on that.
+        """
+        for l in CONTAINER_LABELS_TO_TAGS:
+            if l == 'container_name':
+                for ml in metric.label:
+                    if ml.name == l:
+                        if ml.value == 'POD':
+                            return False
+            elif l not in [ml.name for ml in metric.label]:
+                return False
+        return True
+
+    def _extract_metric_tags(self, labels):
+        """Build a tag list for a Prometheus metric"""
+        tags = []
+        pname, ns = None, None
+        for label in labels:
+            if label.name == 'image':
+                tags += self.kubeutil.extract_image_tags(label.value)
+            elif label.name == "pod_name":
+                pname = label.value
+            elif label.name == 'namespace':
+                ns = label.value
+            else:
+                # id is there but set to None because we don't want it as a tag
+                if CONTAINER_LABELS_TO_TAGS.get(label.name):
+                    tags.append('{}:{}'.format(CONTAINER_LABELS_TO_TAGS[label.name], label.value))
+            if pname and ns:
+                tags += self.kube_pod_tags.get('{}/{}'.format(ns, pname), [])
+        return tags
+
     def container_cpu_usage_seconds_total(self, message, **kwargs):
+        # TODO: this is now a pod metric, need a new pod uid --> pod name index
         metric_name = self.NAMESPACE + '.cpu.usage.total'
         if message.type >= len(METRIC_TYPES):
             self.log.error("Metric type %s unsupported for metric %s" % (message.type, message.name))
@@ -278,7 +393,7 @@ class KubeletCheck(PrometheusCheck):
 
         for metric in message.metric:
             if self._is_container_metric(metric):
-                tags = self.kubeutil.extract_metric_tags(metric.label)
+                tags = self._extract_metric_tags(metric.label)
                 val = getattr(metric, METRIC_TYPES[message.type]).value
                 self.publish_rate(self, metric_name, val, tags)
 
@@ -292,7 +407,7 @@ class KubeletCheck(PrometheusCheck):
         seen_keys = {k: False for k in cache}
         for metric in message.metric:
             if self._is_container_metric(metric):
-                tags = self.kubeutil.extract_metric_tags(metric.label)
+                tags = self._extract_metric_tags(metric.label)
                 c_name = None
                 for t in tags:
                     if t.split(':', 1)[0] == 'container_name':
@@ -318,7 +433,7 @@ class KubeletCheck(PrometheusCheck):
         for metric in message.metric:
             if self._is_container_metric(metric):
                 limit = getattr(metric, METRIC_TYPES[message.type]).value
-                tags = self.kubeutil.extract_metric_tags(metric.label)
+                tags = self._extract_metric_tags(metric.label)
 
                 if m_name:
                     self.publish_gauge(self, m_name, limit, tags)
@@ -334,10 +449,14 @@ class KubeletCheck(PrometheusCheck):
                     if usage:
                         self.publish_gauge(self, pct_m_name, float(usage/float(limit)), tags)
                     else:
-                        self.log.debug("No corresponding usage found for metric %s and container %s, skipping usage_pct for now." % (m_name, c_name))
+                        self.log.debug("No corresponding usage found for metric %s and "
+                                       "container %s, skipping usage_pct for now." % (pct_m_name, c_name))
 
     def container_fs_usage_bytes(self, message, **kwargs):
-        """Number of bytes that are consumed by the container on this filesystem."""
+        """
+        Number of bytes that are consumed by the container on this filesystem.
+        TODO: should we get the detail of written bytes, time spent, etc?
+        """
         metric_name = self.NAMESPACE + '.filesystem.usage'
         if message.type >= len(METRIC_TYPES):
             self.log.error("Metric type %s unsupported for metric %s" % (message.type, message.name))
@@ -356,6 +475,7 @@ class KubeletCheck(PrometheusCheck):
         self._process_limit_metric('', message, self.fs_usage_bytes, pct_m_name)
 
     def container_memory_usage_bytes(self, message, **kwargs):
+        """TODO: should we add swap and rss detail?"""
         metric_name = self.NAMESPACE + '.memory.usage'
         if message.type >= len(METRIC_TYPES):
             self.log.error("Metric type %s unsupported for metric %s" % (message.type, message.name))
@@ -363,6 +483,7 @@ class KubeletCheck(PrometheusCheck):
         self._process_usage_metric(metric_name, message, self.mem_usage_bytes)
 
     def container_spec_memory_limit_bytes(self, message, **kwargs):
+        """TODO: compare with pod spec metrics and kill if redundant"""
         metric_name = self.NAMESPACE + '.memory.limits'
         if message.type >= len(METRIC_TYPES):
             self.log.error("Metric type %s unsupported for metric %s" % (message.type, message.name))
@@ -384,53 +505,42 @@ class KubeletCheck(PrometheusCheck):
                 else:
                     self.log.debug("No mem usage found for container %s, skipping usage_pct for now." % c_name)
 
-    def container_network_receive_bytes_total(self, message, **kwargs):
-        metric_name = self.NAMESPACE + '.network.rx_bytes'
+    def _process_pod_rate(self, metric_name, message):
+        """Takes a simple metric about a pod, reports it as a rate."""
         if message.type >= len(METRIC_TYPES):
             self.log.error("Metric type %s unsupported for metric %s" % (message.type, message.name))
             return
 
         for metric in message.metric:
             if self._is_pod_metric(metric):
-                tags = self.kubeutil.extract_metric_tags(metric.label)
+                tags = self._extract_metric_tags(metric.label)
                 val = getattr(metric, METRIC_TYPES[message.type]).value
                 self.publish_rate(self, metric_name, val, tags)
+
+    def container_network_receive_bytes_total(self, message, **kwargs):
+        """TODO: refactor this and the following 5 metrics"""
+        metric_name = self.NAMESPACE + '.network.rx_bytes'
+        self._process_pod_rate(metric_name, message)
 
     def container_network_transmit_bytes_total(self, message, **kwargs):
         metric_name = self.NAMESPACE + '.network.tx_bytes'
-        if message.type >= len(METRIC_TYPES):
-            self.log.error("Metric type %s unsupported for metric %s" % (message.type, message.name))
-            return
-
-        for metric in message.metric:
-            if self._is_pod_metric(metric):
-                tags = self.kubeutil.extract_metric_tags(metric.label)
-                val = getattr(metric, METRIC_TYPES[message.type]).value
-                self.publish_rate(self, metric_name, val, tags)
+        self._process_pod_rate(metric_name, message)
 
     def container_network_receive_errors_total(self, message, **kwargs):
         metric_name = self.NAMESPACE + '.network.rx_errors'
-        if message.type >= len(METRIC_TYPES):
-            self.log.error("Metric type %s unsupported for metric %s" % (message.type, message.name))
-            return
-
-        for metric in message.metric:
-            if self._is_pod_metric(metric):
-                tags = self.kubeutil.extract_metric_tags(metric.label)
-                val = getattr(metric, METRIC_TYPES[message.type]).value
-                self.publish_rate(self, metric_name, val, tags)
+        self._process_pod_rate(metric_name, message)
 
     def container_network_transmit_errors_total(self, message, **kwargs):
         metric_name = self.NAMESPACE + '.network.tx_errors'
-        if message.type >= len(METRIC_TYPES):
-            self.log.error("Metric type %s unsupported for metric %s" % (message.type, message.name))
-            return
+        self._process_pod_rate(metric_name, message)
 
-        for metric in message.metric:
-            if self._is_pod_metric(metric):
-                tags = self.kubeutil.extract_metric_tags(metric.label)
-                val = getattr(metric, METRIC_TYPES[message.type]).value
-                self.publish_rate(self, metric_name, val, tags)
+    def container_network_transmit_packets_dropped_total(self, message, **kwargs):
+        metric_name = self.NAMESPACE + '.network.tx_dropped'
+        self._process_pod_rate(metric_name, message)
+
+    def container_network_receive_packets_dropped_total(self, message, **kwargs):
+        metric_name = self.NAMESPACE + '.network.rx_dropped'
+        self._process_pod_rate(metric_name, message)
 
     def _update_kube_events(self, instance, event_items):
         """Process kubernetes events"""
@@ -466,3 +576,23 @@ class KubeletCheck(PrometheusCheck):
                 'tags': tags,
             }
             self.event(dd_event)
+
+    def refresh_leader_status(self, instance):
+        """
+        calls kubeutil.refresh_leader and compares the resulting
+        leader status with the previous one.
+        If it changed, update the event collection logic
+        """
+        if not self.leader_candidate:
+            return
+
+        leader_status = self.kubeutil.is_leader
+        self.kubeutil.refresh_leader()
+
+        # nothing changed, no-op
+        if leader_status == self.kubeutil.is_leader:
+            return
+        # else, reset the event collection config
+        else:
+            self.log.info("Leader status changed, updating event collection config...")
+            self._configure_event_collection(instance)
