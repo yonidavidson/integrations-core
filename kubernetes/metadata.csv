@@ -1,8 +1,8 @@
 metric_name,metric_type,interval,unit_name,per_unit_name,description,orientation,integration,short_name
-kubernetes.cpu.capacity,gauge,,,,The number of cores in this machine.,0,kubernetes,k8s.cpu.capacity
-kubernetes.cpu.usage.total,gauge,,percent_nano,,The percentage of CPU time used,-1,kubernetes,k8s.cpu
-kubernetes.cpu.limits,gauge,,cpu,,The limit of cpu cores set,0,kubernetes,k8s.cpu.limits
-kubernetes.cpu.requests,gauge,,cpu,,The requested cpu cores,0,kubernetes,k8s.cpu.requests
+kubernetes.cpu.capacity,gauge,,cpu core,,The number of cores in this machine.,0,kubernetes,k8s.cpu.capacity
+kubernetes.cpu.usage.total,gauge,,nano_core,,The percentage of CPU time used,-1,kubernetes,k8s.cpu
+kubernetes.cpu.limits,gauge,,cpu core,,The limit of cpu cores set,0,kubernetes,k8s.cpu.limits
+kubernetes.cpu.requests,gauge,,cpu core,,The requested cpu cores,0,kubernetes,k8s.cpu.requests
 kubernetes.filesystem.usage,gauge,,byte,,The amount of disk used,-1,kubernetes,k8s.disk.usage
 kubernetes.filesystem.usage_pct,gauge,,fraction,,The percentage of disk used,-1,kubernetes,k8s.disk.used_pct
 kubernetes.memory.capacity,gauge,,byte,,The amount of memory (in bytes) in this machine,0,kubernetes,k8s.mem.capacity
@@ -12,3 +12,14 @@ kubernetes.memory.usage,gauge,,byte,,The amount of memory used,-1,kubernetes,k8s
 kubernetes.network.rx_bytes,gauge,,byte,second,The amount of bytes per second received,0,kubernetes,k8s.net.rx
 kubernetes.network.tx_bytes,gauge,,byte,second,The amount of bytes per second transmitted,0,kubernetes,k8s.net.tx
 kubernetes.network_errors,gauge,,error,second,The amount of network errors per second,-1,kubernetes,k8s.net.errors
+kubernetes_state.deployment.replicas_available,gauge,,,,The number of available replicas per deployment,0,kubernetes,k8s_state.deployment.replicas_available
+kubernetes_state.deployment.replicas_unavailable,gauge,,,,The number of unavailable replicas per deployment,0,kubernetes,k8s_state.deployment.replicas_unavailable
+kubernetes_state.deployment.replicas_updated,gauge,,,,The number of updated replicas per deployment,0,kubernetes,k8s_state.deployment.replicas_updated
+kubernetes_state.deployment.replicas_desired,gauge,,,,The number of desired replicas per deployment,0,kubernetes,k8s_state.deployment.replicas_desired
+kubernetes_state.node.cpu_capacity,gauge,,cpu,,The total CPU resources of the node,0,kubernetes,k8s_state.node.cpu_capacity
+kubernetes_state.node.memory_capacity,gauge,,byte,,The total memory resources of the node,0,kubernetes,k8s_state.node.memory_capacity
+kubernetes_state.node.pods_capacity,gauge,,,,The total pod resources of the node,0,kubernetes,k8s_state.node.pods_capacity
+kubernetes_state.node.cpu_allocatable,gauge,,cpu,,The CPU resources of a node that are available for scheduling,0,kubernetes,k8s_state.node.cpu_allocatable
+kubernetes_state.node.memory_allocatable,gauge,,byte,,The memory resources of a node that are available for scheduling,0,kubernetes,k8s_state.node.memory_allocatable
+kubernetes_state.node.pods_allocatable,gauge,,,,The pod resources of a node that are available for scheduling,0,kubernetes,k8s_state.node.pods_allocatable
+kubernetes_state.node.unschedulable,gauge,,,,Whether a node can schedule new pods,0,kubernetes,k8s_state.node.unschedulable
